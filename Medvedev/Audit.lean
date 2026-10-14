@@ -1,20 +1,21 @@
 import Medvedev
 import Lean.Util.CollectAxioms
+import Lean.Replay
 
 /-!
-# Audit entry point
+# 감사 진입점 (단순화 버전)
 
-The command-line trust flag alone does not recheck imported proof bodies.
-This file explicitly removes every project declaration from a copy of the
-kernel environment and adds them back through `Kernel.Environment.addDeclCore`,
-in dependency order. Inductives are checked again; their generated constructors
-and recursors are compared with the originals. External library declarations
-remain trusted imports. The separate dependency audit allows only Lean's
-three standard classical axioms. Source-file inventory, module origin, and all
-local declarations determine coverage; namespace prefixes alone are insufficient.
-`MEDVEDEV_AUDIT_ROOT` defaults to the current directory. The driver imports this
-entire module before calling `auditProject`; compiling this file alone does not
-execute the replay. See DEEP_AUDIT.md and `scripts/run_audit.py`.
+1. 공리 감사: 모든 프로젝트 선언이 의존하는 공리를 Mathlib까지 추적하여
+   `propext`, `Classical.choice`, `Quot.sound` 외에는 없음을 확인한다.
+   (`sorry`는 `sorryAx`, `native_decide`는 `Lean.ofReduceBool` 공리로 나타나므로 여기서 걸린다.)
+2. 커널 재검사: 프로젝트 이외의 모듈(Lean 코어, Mathlib 등)만 불러온 새 환경에
+   Lean 코어의 `Environment.replay`로 프로젝트 선언을 모두 다시 넣어 커널이 검사하게 한다.
+   생성자와 재귀자는 귀납 타입을 다시 받을 때 커널이 새로 만든 것과 저장된 것이
+   같은지 `replay`가 비교한다.
+
+외부 라이브러리 선언은 신뢰하는 전제로 둔다.
+감사 함수는 이 파일을 끝까지 컴파일한 뒤 별도 파일에서 import하여 실행한다
+(`scripts/run_audit.py`). 그래야 이 파일의 어느 위치에 추가된 선언도 감사 대상에 포함된다.
 -/
 
 #print axioms Medvedev.WangCode.correct
@@ -37,129 +38,50 @@ execute the replay. See DEEP_AUDIT.md and `scripts/run_audit.py`.
 #print axioms Medvedev.not_rePred_inML
 #print axioms Medvedev.no_computable_bound
 
--- Access is needed only to remove constants from a temporary environment.
-open private Lean.Kernel.Environment.mk Lean.Kernel.Environment.extensions
-  Lean.Kernel.Environment.irBaseExts from Lean.Environment
-
+open Lean in
 set_option maxHeartbeats 0 in
-def Medvedev.auditProject : Lean.Elab.Command.CommandElabM Unit := do
-  let env ← Lean.getEnv
-  let auditRoot : System.FilePath := (← IO.getEnv "MEDVEDEV_AUDIT_ROOT").getD "."
-  unless (← (auditRoot / "Medvedev.lean").pathExists) &&
-      (← (auditRoot / "Medvedev" / "Audit.lean").pathExists) do
-    throwError "Audit source root is missing Medvedev.lean or Medvedev/Audit.lean: {auditRoot}"
-  let mut projectModules : Array String := #[]
-  for entry in ← auditRoot.readDir do
-    if entry.path.extension == some "lean" then
-      if let some stem := entry.path.fileStem then
-        projectModules := projectModules.push stem
-  let baseDepth := auditRoot.components.length
-  for path in ← (auditRoot / "Medvedev").walkDir do
-    if path.extension == some "lean" then
-      let moduleName := String.intercalate "." ((path.withExtension "").components.drop baseDepth)
-      projectModules := projectModules.push moduleName
-  let isProject := fun (name : Lean.Name) =>
-    name.toString.startsWith "Medvedev." || name.toString.startsWith "_private.Medvedev." ||
-      match env.getModuleIdxFor? name with
-      | some idx =>
-        let mod := env.header.moduleNames[idx.toNat]!
-        projectModules.contains mod.toString || mod == `Medvedev || mod.toString.startsWith "Medvedev."
-      | none => true -- Current-file declarations have no imported-module index.
-  let mut names : Array Lean.Name := #[]
-  let mut theoremCount := 0
-  for (name, info) in env.constants.toList do
-    if isProject name then
-      names := names.push name
-      if info.isUnsafe then
-        throwError "Unsafe project declaration is forbidden: {name}"
-      match info with
-      | .axiomInfo _ => throwError "Project axiom is forbidden: {name}"
-      | .thmInfo _ => theoremCount := theoremCount + 1
-      | _ => pure ()
-  let collect : Lean.CollectAxioms.M Unit := names.forM Lean.CollectAxioms.collect
-  let (_, result) := (collect.run env).run {}
-  let allowed : Array Lean.Name := #[`propext, `Classical.choice, `Quot.sound]
-  for ax in result.axioms do
+def Medvedev.auditProject : Elab.Command.CommandElabM Unit := do
+  let env ← getEnv
+
+  -- 감사 범위. 최상위 소스 파일이 Medvedev.lean 하나뿐이면 (나머지는 모두 Medvedev/ 아래),
+  -- 프로젝트 모듈은 정확히 이름이 `Medvedev`로 시작하는 모듈들이다.
+  let root : System.FilePath := (← IO.getEnv "MEDVEDEV_AUDIT_ROOT").getD "."
+  let topLevel := (← root.readDir).filter (·.path.extension == some "lean") |>.map (·.fileName)
+  unless topLevel == #["Medvedev.lean"] do
+    throwError "Unexpected top-level Lean files in {root}: {topLevel}"
+  let isProjectModule (m : Name) : Bool := (`Medvedev).isPrefixOf m
+  let isProject (n : Name) : Bool :=
+    match env.getModuleIdxFor? n with
+    | some idx => isProjectModule env.header.moduleNames[idx.toNat]!
+    | none => true -- 현재 파일에서 정의된 선언
+
+  -- 프로젝트 선언 수집. unsafe 선언은 커널 검사를 받지 않으므로 금지한다.
+  let mut project : Std.HashMap Name ConstantInfo := {}
+  for (n, ci) in env.constants.toList do
+    if isProject n then
+      if ci.isUnsafe then throwError "Unsafe project declaration is forbidden: {n}"
+      project := project.insert n ci
+  if project.isEmpty then throwError "No project declarations were audited"
+
+  -- 1. 공리 감사 (프로젝트 안의 axiom 선언도 여기서 걸린다)
+  let collect : CollectAxioms.M Unit := project.keys.forM CollectAxioms.collect
+  let (_, s) := (collect.run env).run {}
+  let allowed := #[``propext, ``Classical.choice, ``Quot.sound]
+  for ax in s.axioms do
     unless allowed.contains ax do
       throwError "Unexpected axiom in the project dependency graph: {ax}"
-  if names.isEmpty then throwError "No project declarations were audited"
-  Lean.logInfo m!"AXIOM AUDIT PASSED: {names.size} project declarations, {theoremCount} theorems; axioms = {result.axioms}"
+  let theorems := project.fold (init := (0:Nat)) fun k _ ci => if ci matches .thmInfo _ then k + 1 else k
 
-  -- Strip project constants, including ones outside the project's namespace.
-  let mut retained : Lean.ConstMap := {}
-  for (name, info) in env.constants.toList do
-    unless isProject name do retained := retained.insert name info
-  let original := env.toKernelEnv
-  let mut checked := Lean.Kernel.Environment.mk retained original.quotInit original.diagnostics
-    original.const2ModIdx (Lean.Kernel.Environment.extensions original)
-    (Lean.Kernel.Environment.irBaseExts original) original.header
-  let mut pending : Array Lean.Declaration := #[]
-  let mut inductiveCount := 0
-  let mut compilerHelperCount := 0
-  for name in names do
-    let some info := env.find? name | throwError "Missing project constant: {name}"
-    match info with
-    | .thmInfo v => pending := pending.push (.thmDecl v)
-    | .defnInfo v =>
-      if v.safety == .partial then
-        -- Lean generates these recursive implementations from total definitions.
-        -- They are opaque to kernel reduction; replay their bodies too.
-        unless name.toString.endsWith "._unsafe_rec" && v.all == [name] do
-          throwError "Unexpected partial declaration: {name}"
-        pending := pending.push (.mutualDefnDecl [v])
-        compilerHelperCount := compilerHelperCount + 1
-      else pending := pending.push (.defnDecl v)
-    | .opaqueInfo v => pending := pending.push (.opaqueDecl v)
-    | .inductInfo v =>
-      -- The present project has no nested inductives. Fail rather than silently
-      -- weakening the replay if a future version introduces them.
-      unless v.numNested == 0 do throwError "Nested inductive replay is unsupported: {name}"
-      if v.all.head? == some name then
-        let types ← v.all.mapM fun n => do
-          let some (.inductInfo i) := env.find? n | throwError "Missing inductive: {n}"
-          let ctors ← i.ctors.mapM fun c => do
-            let some (.ctorInfo ci) := env.find? c | throwError "Missing constructor: {c}"
-            pure ({ name := c, type := ci.type } : Lean.Constructor)
-          pure ({ name := n, type := i.type, ctors } : Lean.InductiveType)
-        pending := pending.push (.inductDecl v.levelParams v.numParams types false)
-        inductiveCount := inductiveCount + 1
-    | .ctorInfo _ | .recInfo _ => pure () -- Regenerated by the checked inductive declaration.
-    | _ => throwError "Unsupported project declaration: {name}"
+  logInfo m!"AXIOM AUDIT PASSED: {project.size} project declarations, {theorems} theorems; axioms = {s.axioms}"
 
-  let declarationCount := pending.size
-  while !pending.isEmpty do
-    let mut later : Array Lean.Declaration := #[]
-    let mut progress := false
-    for decl in pending do
-      let dependencies : Array Lean.Name := Id.run <|
-        decl.foldExprM (fun ns e => pure (ns ++ e.getUsedConstants)) #[]
-      let ownNames := decl.getNames
-      if dependencies.all (fun n => ownNames.contains n || (checked.find? n).isSome) then
-        match checked.addDeclCore 0 decl none with
-        | .ok next => checked := next
-        | .error ex => throwError "Kernel replay failed for {decl.getTopLevelNames}:\n{ex.toMessageData (← Lean.getOptions)}"
-        progress := true
-      else later := later.push decl
-    unless progress do
-      throwError "Kernel replay has cyclic or missing dependencies: {later.map (·.getTopLevelNames)}"
-    pending := later
-
-  -- In particular, don't trust stored recursor reduction rules or constructor
-  -- metadata merely because their parent inductive was accepted.
-  for name in names do
-    let some old := env.find? name | throwError "Missing original: {name}"
-    let some fresh := checked.find? name | throwError "Project constant was not replayed: {name}"
-    let same : Bool := match old, fresh with
-      | .inductInfo a, .inductInfo b =>
-        a.toConstantVal == b.toConstantVal && a.numParams == b.numParams &&
-        a.numIndices == b.numIndices && a.all == b.all && a.ctors == b.ctors &&
-        a.numNested == b.numNested && a.isRec == b.isRec &&
-        a.isUnsafe == b.isUnsafe && a.isReflexive == b.isReflexive
-      | .ctorInfo a, .ctorInfo b => a == b
-      | .recInfo a, .recInfo b => a == b
-      | .thmInfo a, .thmInfo b => a == b
-      | .defnInfo a, .defnInfo b => a == b
-      | .opaqueInfo a, .opaqueInfo b => a == b
-      | _, _ => false
-    unless same do throwError "Replayed declaration differs from stored original: {name}"
-  Lean.logInfo m!"KERNEL REPLAY PASSED: {declarationCount} declaration groups, {inductiveCount} inductive groups, {compilerHelperCount} compiler helpers; all {names.size} project constants reproduced"
+  -- 2. 커널 재검사: 프로젝트 이외의 모듈만 불러온 환경에 프로젝트 선언을 다시 넣는다.
+  -- `replay`는 컴파일러가 만드는 partial 보조 정의를 건너뛰지만, 재검사되는 선언 중
+  -- 하나라도 그것에 의존하면 "unknown constant"로 실패하므로 정리에 영향을 줄 수 없다.
+  let baseImports := env.header.moduleNames.filter (!isProjectModule ·)
+    |>.map fun m => ({ module := m } : Import)
+  let base ← importModules baseImports (← getOptions)
+  let checked ← base.replay project
+  for (n, ci) in project do
+    unless ci.isPartial || (checked.toKernelEnv.find? n).isSome do
+      throwError "Project constant was not replayed: {n}"
+  logInfo m!"KERNEL REPLAY PASSED: all {project.size} project constants replayed (except compiler-generated partial helpers)"
